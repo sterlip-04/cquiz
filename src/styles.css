@@ -1786,3 +1786,18 @@ select {
     animation: none !important;
   }
 }
+
+/* Google sign-in */
+.google-button {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  min-height: 44px;
+  margin: 8px 0 4px;
+}
+.login-divider {
+  text-align: center;
+  font-size: 0.875rem;
+  opacity: 0.75;
+  margin: 12px 0 4px;
+}
