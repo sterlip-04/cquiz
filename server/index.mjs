@@ -24,6 +24,12 @@ import {
 import * as engine from "./engine.mjs";
 import { recalculate, snapshot } from "./scoring.mjs";
 import { evaluate, rehearsalEvaluate } from "./provider.mjs";
+import {
+  googleConfig,
+  createGoogleVerifier,
+  verifiedGoogleEmail,
+  normalizeEmail,
+} from "./google.mjs";
 export async function createApp(options = {}) {
   const serverless = options.serverless === true;
   assert(
@@ -44,6 +50,18 @@ export async function createApp(options = {}) {
   );
   const salt = randomBytes(16),
     passwordHash = scryptSync(password, salt, 32);
+  const google = googleConfig(options),
+    verifyGoogle = google.enabled
+      ? createGoogleVerifier(google, options)
+      : null;
+  const googleCSP = google.enabled
+    ? {
+        script: " https://accounts.google.com/gsi/client",
+        style: " https://accounts.google.com/gsi/style",
+        frame: "; frame-src https://accounts.google.com/gsi/",
+        connect: " https://accounts.google.com/gsi/",
+      }
+    : { script: "", style: "", frame: "", connect: "" };
   const origin =
     options.origin ??
     process.env.PUBLIC_ORIGIN ??
@@ -177,11 +195,14 @@ export async function createApp(options = {}) {
     res.set({
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
+      // Google's sign-in button checks the page origin, so share only the
+      // origin (never the path) when Google sign-in is enabled.
+      "Referrer-Policy": google.enabled
+        ? "strict-origin-when-cross-origin"
+        : "no-referrer",
       "X-Frame-Options": "DENY",
       "Permissions-Policy": "microphone=(self), camera=()",
-      "Content-Security-Policy":
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      "Content-Security-Policy": `default-src 'self'; script-src 'self'${googleCSP.script}; style-src 'self' 'unsafe-inline'${googleCSP.style}; font-src 'self'; img-src 'self' data:; connect-src 'self'${googleCSP.connect}${googleCSP.frame}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
     });
     if (
       !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
@@ -259,6 +280,31 @@ export async function createApp(options = {}) {
       timingSafeEqual(candidate, passwordHash),
       "Incorrect instructor password.",
       401,
+    );
+    if (req.session) await store.revoke(req.session.token);
+    const s = await store.session("admin");
+    setCookie(res, s.token);
+    res.json({ role: "admin", csrf: s.csrf });
+  });
+  app.get("/api/auth/config", (req, res) =>
+    res.json({
+      googleClientId: google.enabled ? google.clientId : null,
+      googleAdmin: google.enabled && google.adminEmails.size > 0,
+    }),
+  );
+  app.post("/api/admin/google", async (req, res) => {
+    await throttle(`admin:${clientIP(req)}`, 8);
+    const email = await verifiedGoogleEmail(
+      google,
+      verifyGoogle,
+      req.body.credential,
+    );
+    assert(
+      [...google.adminEmails].some(
+        (a) => normalizeEmail(a, google.aliases) === email,
+      ),
+      "This Google account is not on the instructor list.",
+      403,
     );
     if (req.session) await store.revoke(req.session.token);
     const s = await store.session("admin");
@@ -679,28 +725,8 @@ export async function createApp(options = {}) {
           ),
         );
   });
-  app.post("/api/student/join", async (req, res) => {
-    await throttle(`join:${clientIP(req)}`, 500);
-    const { examId, email, studentId } = req.body;
-    assert(
-      typeof email === "string" &&
-        typeof studentId === "string" &&
-        email.length <= 254 &&
-        studentId.length <= 40,
-      "Enter your school email and student ID.",
-    );
-    await throttle(`join-person:${hash(email.trim().toLowerCase())}`, 12);
-    const e = await store.get(examId);
-    assert(
-      e.status === "lobby" || e.status === "running",
-      "This exam is no longer accepting connections.",
-      409,
-    );
-    const person = e.roster.find(
-      (s) =>
-        s.email === email.trim().toLowerCase() && s.id === studentId.trim(),
-    );
-    assert(person, "Email and student ID do not match the roster.", 401);
+  async function joinAs(req, res, e, person) {
+    const examId = e.id;
     if (
       req.session?.role === "student" &&
       req.session.exam_id === examId &&
@@ -719,6 +745,60 @@ export async function createApp(options = {}) {
       return { studentId: person.id };
     });
     res.json({ role: "student", csrf: s.csrf, examId });
+  }
+  async function openExam(examId) {
+    const e = await store.get(examId);
+    assert(
+      e.status === "lobby" || e.status === "running",
+      "This exam is no longer accepting connections.",
+      409,
+    );
+    return e;
+  }
+  app.post("/api/student/join", async (req, res) => {
+    await throttle(`join:${clientIP(req)}`, 500);
+    const { examId, email, studentId } = req.body;
+    assert(
+      typeof email === "string" &&
+        typeof studentId === "string" &&
+        email.length <= 254 &&
+        studentId.length <= 40,
+      "Enter your school email and student ID.",
+    );
+    await throttle(`join-person:${hash(email.trim().toLowerCase())}`, 12);
+    const e = await openExam(examId);
+    // With Google sign-in configured, live exams require a verified Google
+    // account. Rehearsals keep email + ID so fictional students can join.
+    assert(
+      !google.enabled || e.mode === "rehearsal",
+      "Sign in with your school Google account to join this exam.",
+      403,
+    );
+    const person = e.roster.find(
+      (s) =>
+        s.email === email.trim().toLowerCase() && s.id === studentId.trim(),
+    );
+    assert(person, "Email and student ID do not match the roster.", 401);
+    await joinAs(req, res, e, person);
+  });
+  app.post("/api/student/google", async (req, res) => {
+    await throttle(`join:${clientIP(req)}`, 500);
+    const email = await verifiedGoogleEmail(
+      google,
+      verifyGoogle,
+      req.body.credential,
+    );
+    await throttle(`join-person:${hash(email)}`, 12);
+    const e = await openExam(req.body.examId);
+    const person = e.roster.find(
+      (s) => normalizeEmail(s.email, google.aliases) === email,
+    );
+    assert(
+      person,
+      "This Google account is not on the roster for this exam. Ask your instructor.",
+      401,
+    );
+    await joinAs(req, res, e, person);
   });
   app.use("/api/student", student);
   function studentView(e, id) {

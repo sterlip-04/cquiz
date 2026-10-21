@@ -29,6 +29,7 @@ import {
 } from "@phosphor-icons/react";
 import { api, setCsrf, setTransport, getTransport } from "./api";
 import { SpeechCapture, speechAvailable } from "./speech";
+import { GoogleButton, useAuthConfig } from "./google";
 import type {
   AdminState,
   Exam,
@@ -842,6 +843,20 @@ function Join({ onAuth }: { onAuth: (role: string, csrf: string) => void }) {
     [email, setEmail] = useState(""),
     [studentId, setStudentId] = useState("");
   const action = useAction();
+  const config = useAuthConfig();
+  const selected = exams.find((e) => e.id === examId);
+  // Live exams use school Google sign-in when it is configured; rehearsals
+  // keep email + student ID so fictional students can join.
+  const useGoogle = !!config?.googleClientId && selected?.mode !== "rehearsal";
+  function googleJoin(credential: string) {
+    void action.run(async () => {
+      const r = await api<{ role: string; csrf: string }>("/student/google", {
+        examId,
+        credential,
+      });
+      onAuth(r.role, r.csrf);
+    });
+  }
   useEffect(() => {
     void api<{ exams: typeof exams }>("/public")
       .then((r) => {
@@ -905,33 +920,50 @@ function Join({ onAuth }: { onAuth: (role: string, csrf: string) => void }) {
               )}
             </div>
           )}
-          <Field
-            label="School email"
-            id="email"
-            type="email"
-            inputMode="email"
-            autoComplete="email"
-            value={email}
-            onChange={setEmail}
-          />
-          <Field
-            label="Student ID number"
-            id="student-id"
-            inputMode="numeric"
-            autoComplete="off"
-            value={studentId}
-            onChange={setStudentId}
-          />
+          {useGoogle ? (
+            examId && (
+              <GoogleButton
+                key={examId}
+                clientId={config!.googleClientId!}
+                onCredential={googleJoin}
+                onError={action.setError}
+                text="continue_with"
+              />
+            )
+          ) : (
+            <>
+              <Field
+                label="School email"
+                id="email"
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                value={email}
+                onChange={setEmail}
+              />
+              <Field
+                label="Student ID number"
+                id="student-id"
+                inputMode="numeric"
+                autoComplete="off"
+                value={studentId}
+                onChange={setStudentId}
+              />
+              <Button
+                type="submit"
+                className="wide"
+                variant="accent"
+                disabled={action.busy || !examId}
+              >
+                {action.busy ? "Joining…" : "Join your exam"}
+                <ArrowRightIcon />
+              </Button>
+            </>
+          )}
           {action.error && <Notice>{action.error}</Notice>}
-          <Button
-            type="submit"
-            className="wide"
-            variant="accent"
-            disabled={action.busy || !examId}
-          >
-            {action.busy ? "Joining…" : "Join your exam"}
-            <ArrowRightIcon />
-          </Button>
+          {useGoogle && action.busy && (
+            <Notice kind="info">Joining your exam…</Notice>
+          )}
           {!exams.length && (
             <Notice kind="info">
               No exam is open yet. Your instructor needs to create one before
@@ -940,8 +972,9 @@ function Join({ onAuth }: { onAuth: (role: string, csrf: string) => void }) {
           )}
         </form>
         <p className="join-note">
-          Use the email and ID on your instructor’s roster. You’ll check your
-          microphone next.
+          {useGoogle
+            ? "Use the school Google account on your instructor’s roster. You’ll check your microphone next."
+            : "Use the email and ID on your instructor’s roster. You’ll check your microphone next."}
         </p>
       </main>
       <footer className="join-footer">
@@ -958,6 +991,7 @@ function AdminLogin({
 }) {
   const [password, setPassword] = useState("");
   const action = useAction();
+  const config = useAuthConfig();
   return (
     <div className="admin-login">
       <Brand />
@@ -971,6 +1005,24 @@ function AdminLogin({
           under control.
         </h1>
         <p>Sign in to prepare questions, manage tables, and inspect results.</p>
+        {config?.googleClientId && config.googleAdmin && (
+          <>
+            <GoogleButton
+              clientId={config.googleClientId}
+              onError={action.setError}
+              onCredential={(credential) =>
+                void action.run(async () => {
+                  const r = await api<{ role: string; csrf: string }>(
+                    "/admin/google",
+                    { credential },
+                  );
+                  onAuth(r.role, r.csrf);
+                })
+              }
+            />
+            <p className="login-divider">or use the instructor password</p>
+          </>
+        )}
         <form
           onSubmit={(e) => {
             e.preventDefault();
